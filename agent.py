@@ -5,6 +5,7 @@ Data Warehouse Agent — Dual-agent collaborative architecture
 """
 
 import os
+from datetime import datetime
 
 from dotenv import load_dotenv
 
@@ -13,6 +14,16 @@ load_dotenv()
 from anthropic import Anthropic
 
 from agent_tools import execute_sql_query, get_warehouse_schema
+
+# ---------- Trace log accumulator ----------
+_trace_lines: list[str] = []
+TRACE_LOG_PATH = "agent_run_trace.log"
+
+
+def _emit(msg: str = "") -> None:
+    """Print to terminal AND accumulate for trace log."""
+    print(msg)
+    _trace_lines.append(msg)
 
 # ---------- Anthropic client (DeepSeek-compatible endpoint) ----------
 client = Anthropic(
@@ -32,6 +43,7 @@ QA_SYSTEM_PROMPT = (
     "1. 严禁使用 SELECT *；\n"
     "2. 关键字必须大写；\n"
     "3. 大表关联必须指定字段，不能盲目全表扫描。\n"
+    "4. 【新增红线】如果是建表语句，必须在 CREATE TABLE 之前加上 DROP TABLE IF EXISTS [表名]; 确保脚本可重复执行！\n"
     "如果完全合格，请只输出 'PASS'；如果有问题，请详细指出修改意见，"
     "并以 'REJECT: [具体原因]' 开头。"
 )
@@ -114,20 +126,31 @@ def call_qa_agent(generated_sql: str) -> str:
     return _extract_text(response)
 
 
-def run_dw_agent(user_requirement: str) -> None:
-    """
-    Orchestrate the dual-agent workflow with self-correction loop.
+from typing import Any, Generator
 
-    1. Fetch warehouse schema.
-    2. Dev Agent generates initial SQL.
-    3. QA Agent reviews; if REJECT → Dev rewrites → repeat (max 3).
-    4. On PASS → execute the SQL.
+Event = dict[str, Any]
+
+
+def run_dw_agent_stream(user_requirement: str) -> Generator[Event, None, None]:
+    """
+    Generator variant of run_dw_agent for Streamlit / web consumption.
+
+    Yields structured events instead of printing:
+      {"type": "header",   "message": ..., "requirement": ...}
+      {"type": "info",     "message": ...}
+      {"type": "schema",   "message": ..., "schema": dict}
+      {"type": "sql",      "message": ..., "sql": ..., "round": int}
+      {"type": "verdict",  "message": ..., "round": int, "is_pass": bool}
+      {"type": "done",     "message": ..., "sql": ..., "result_rows": int, "rounds": int}
+      {"type": "error",    "message": ...}
     """
     MAX_RETRIES = 3
 
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    yield {"type": "header", "message": f"Started at {now}", "requirement": user_requirement}
+
     # ----- Step 1: Get schema -----
-    print("=" * 60)
-    print("[Step 1] Fetching warehouse schema ...")
+    yield {"type": "info", "message": "[Step 1] Fetching warehouse schema ..."}
     schema = get_warehouse_schema()
 
     schema_text_lines = ["Current warehouse tables and columns:"]
@@ -135,44 +158,146 @@ def run_dw_agent(user_requirement: str) -> None:
         col_list = ", ".join(f"{c['name']} {c['type']}" for c in cols)
         schema_text_lines.append(f"  - {table}({col_list})")
     schema_text = "\n".join(schema_text_lines)
-    print(schema_text)
+    yield {"type": "schema", "message": schema_text, "schema": schema}
 
     # ----- Step 2: Dev Agent first attempt -----
-    print("\n[Step 2] Dev Agent generating first SQL draft ...\n")
+    yield {"type": "info", "message": "[Step 2] Dev Agent generating first SQL draft ..."}
     sql = call_dev_agent(user_requirement, schema_text)
-    print(f"{'─' * 40}\n[Dev] Generated SQL:\n{sql}\n{'─' * 40}")
+    yield {"type": "sql", "message": "[Dev] Generated SQL:", "sql": sql, "round": 0}
 
     # ----- Step 3-4: QA <-> Dev loop -----
     for round_no in range(1, MAX_RETRIES + 1):
-        print(f"\n[Round {round_no}] QA Architect is reviewing ...\n")
+        yield {"type": "info", "message": f"[Round {round_no}] QA Architect is reviewing ..."}
         verdict = call_qa_agent(sql)
-        print(f"[QA] Verdict:\n  {verdict}\n")
+        is_pass = verdict.strip().upper().startswith("PASS")
+        yield {
+            "type": "verdict",
+            "message": verdict,
+            "round": round_no,
+            "is_pass": is_pass,
+        }
+
+        if is_pass:
+            result = execute_sql_query(sql)
+            updated_schema = get_warehouse_schema()
+            yield {
+                "type": "done",
+                "message": ">>> QA Architect: APPROVED. SQL executed.",
+                "sql": sql,
+                "result_rows": len(result),
+                "rounds": round_no,
+                "updated_schema": updated_schema,
+            }
+            return
+
+        # REJECT path
+        yield {
+            "type": "info",
+            "message": f">>> QA Architect REJECTED. Reworking (attempt {round_no}/{MAX_RETRIES}) ...",
+        }
+        sql = call_dev_agent(user_requirement, schema_text, feedback=verdict)
+        yield {"type": "sql", "message": "[Dev] Revised SQL:", "sql": sql, "round": round_no}
+
+    yield {
+        "type": "error",
+        "message": f"!!! Max retries ({MAX_RETRIES}) exceeded. SQL did not pass QA review.",
+        "sql": sql,
+    }
+
+
+def run_dw_agent(user_requirement: str) -> None:
+    """
+    Orchestrate the dual-agent workflow with self-correction loop.
+
+    1. Fetch warehouse schema.
+    2. Dev Agent generates initial SQL.
+    3. QA Agent reviews; if REJECT → Dev rewrites → repeat (max 3).
+    4. On PASS → execute the SQL and persist trace log.
+    """
+    MAX_RETRIES = 3
+
+    # ----- Header -----
+    _emit("=" * 60)
+    _emit(f"Data Warehouse Agent — Trace Log")
+    _emit(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    _emit(f"Requirement: {user_requirement}")
+    _emit("=" * 60)
+
+    # ----- Step 1: Get schema -----
+    _emit("\n[Step 1] Fetching warehouse schema ...")
+    schema = get_warehouse_schema()
+
+    schema_text_lines = ["Current warehouse tables and columns:"]
+    for table, cols in schema.items():
+        col_list = ", ".join(f"{c['name']} {c['type']}" for c in cols)
+        schema_text_lines.append(f"  - {table}({col_list})")
+    schema_text = "\n".join(schema_text_lines)
+    _emit(schema_text)
+
+    # ----- Step 2: Dev Agent first attempt -----
+    _emit("\n[Step 2] Dev Agent generating first SQL draft ...\n")
+    sql = call_dev_agent(user_requirement, schema_text)
+    _emit(f"{'─' * 40}\n[Dev] Generated SQL:\n{sql}\n{'─' * 40}")
+
+    final_sql = ""
+    outcome = ""
+
+    # ----- Step 3-4: QA <-> Dev loop -----
+    for round_no in range(1, MAX_RETRIES + 1):
+        _emit(f"\n[Round {round_no}] QA Architect is reviewing ...\n")
+        verdict = call_qa_agent(sql)
+        _emit(f"[QA] Verdict:\n  {verdict}\n")
 
         if verdict.strip().upper().startswith("PASS"):
-            print("=" * 60)
-            print(">>> QA Architect: APPROVED. Executing SQL. <<<")
-            print("=" * 60)
+            _emit("=" * 60)
+            _emit(">>> QA Architect: APPROVED. Executing SQL. <<<")
+            _emit("=" * 60)
             result = execute_sql_query(sql)
-            print(f"\n  Execution done, {len(result)} rows returned/affected.")
+            _emit(f"\n  Execution done, {len(result)} rows returned/affected.")
+
+            final_sql = sql
+            outcome = "PASS"
 
             # Verify new tables
             updated_schema = get_warehouse_schema()
-            print(f"\n  Updated schema now has {len(updated_schema)} table(s):")
+            _emit(f"\n  Updated schema now has {len(updated_schema)} table(s):")
             for t in updated_schema:
-                print(f"    - {t}")
+                _emit(f"    - {t}")
+
+            # ----- Write trace log to file -----
+            _flush_trace(final_sql, outcome, round_no)
             return
 
         # REJECT path: feed critique back to Dev
-        print(f">>> QA Architect REJECTED. Reworking (attempt {round_no}/{MAX_RETRIES}) ...\n")
+        _emit(f">>> QA Architect REJECTED. Reworking (attempt {round_no}/{MAX_RETRIES}) ...\n")
         sql = call_dev_agent(user_requirement, schema_text, feedback=verdict)
-        print(f"{'─' * 40}\n[Dev] Revised SQL:\n{sql}\n{'─' * 40}")
+        _emit(f"{'─' * 40}\n[Dev] Revised SQL:\n{sql}\n{'─' * 40}")
 
-    print("\n!!! Max retries exceeded. The generated SQL did not pass QA review. !!!")
+    outcome = "FAILED"
+    _emit("\n!!! Max retries exceeded. The generated SQL did not pass QA review. !!!")
+    _flush_trace(sql if sql else "", outcome, MAX_RETRIES)
+
+
+def _flush_trace(final_sql: str, outcome: str, rounds: int) -> None:
+    """Append the final summary section and write the full trace to disk."""
+    _emit("=" * 60)
+    _emit(f"FINISHED at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    _emit(f"Outcome   : {outcome} (rounds: {rounds})")
+    _emit(f"Final SQL :")
+    _emit(f"{final_sql}")
+    _emit("=" * 60)
+
+    try:
+        with open(TRACE_LOG_PATH, "w", encoding="utf-8") as f:
+            f.write("\n".join(_trace_lines))
+        print(f"\n[Trace log saved to: {TRACE_LOG_PATH}]")
+    except OSError as e:
+        print(f"\n[WARNING] Failed to write trace log: {e}")
 
 
 if __name__ == "__main__":
     # "Phishing" test — likely to trigger SELECT *, testing QA's rejection mechanism
     requirement = (
-        "把订单表和用户表的所有数据全部拼在一起查出来，帮我建个宽表。"
+        "统计一下每个城市的用户注册量，帮我建一张叫 user_city_stat 的表。"
     )
     run_dw_agent(requirement)

@@ -2,7 +2,13 @@
   "permissions": {
     "allow": [
       "Bash(python agent.py)",
-      "Bash(python -c \"from agent_tools import get_warehouse_schema, execute_sql_query; print\\('Schema:'\\); [print\\(f'  {t}: {c}'\\) for t,c in get_warehouse_schema\\(\\).items\\(\\)]; print\\('\\\\ndws_city_sales data:'\\); [print\\(f'  {r}'\\) for r in execute_sql_query\\('SELECT * FROM dws_city_sales ORDER BY total_sales DESC'\\)]\")"
+      "Bash(python -c \"from agent_tools import get_warehouse_schema, execute_sql_query; print\\('Schema:'\\); [print\\(f'  {t}: {c}'\\) for t,c in get_warehouse_schema\\(\\).items\\(\\)]; print\\('\\\\ndws_city_sales data:'\\); [print\\(f'  {r}'\\) for r in execute_sql_query\\('SELECT * FROM dws_city_sales ORDER BY total_sales DESC'\\)]\")",
+      "Bash(python -c \"import streamlit; print\\('streamlit', streamlit.__version__\\)\")",
+      "Bash(python -c \"from agent import run_dw_agent_stream; print\\('agent.py imports OK'\\); from app import *; print\\('app.py imports OK'\\)\")",
+      "Bash(streamlit run *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py', encoding='utf-8'\\).read\\(\\)\\); print\\('app.py syntax OK'\\)\")",
+      "Bash(Get-Process -Name \"streamlit\" -ErrorAction SilentlyContinue)",
+      "Bash(ft -a)"
     ]
   }
 }
