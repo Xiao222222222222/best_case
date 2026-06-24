@@ -8,7 +8,8 @@
       "Bash(streamlit run *)",
       "Bash(python -c \"import ast; ast.parse\\(open\\('app.py', encoding='utf-8'\\).read\\(\\)\\); print\\('app.py syntax OK'\\)\")",
       "Bash(Get-Process -Name \"streamlit\" -ErrorAction SilentlyContinue)",
-      "Bash(ft -a)"
+      "Bash(ft -a)",
+      "Bash(python -c ' *)"
     ]
   }
 }
