@@ -1,0 +1,80 @@
+# ============================================================
+# Python .gitignore
+# ============================================================
+
+# ---------- 编译产物 / 字节码 ----------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# ---------- 分发包 ----------
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+sdist/
+develop-eggs/
+*.whl
+
+# ---------- 虚拟环境 ----------
+venv/
+.venv/
+env/
+.env/
+ENV/
+env.bak/
+venv.bak/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ---------- 数据库 / SQLite ----------
+*.db
+*.sqlite
+*.sqlite3
+
+# ---------- 环境变量 / 敏感配置 ----------
+.env
+.env.*
+!.env.example
+*.local
+secrets.*
+config.local.*
+
+# ---------- IDE / 编辑器 ----------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ---------- 测试 / 覆盖率 ----------
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.pytest_cache/
+.hypothesis/
+*.cover
+
+# ---------- 类型检查 ----------
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# ---------- 日志 ----------
+*.log
+logs/
+
+# ---------- Jupyter Notebook ----------
+.ipynb_checkpoints/
+*.ipynb
+
+# ---------- 其他 ----------
+.cache/
+*.manifest
+*.spec
