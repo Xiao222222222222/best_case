@@ -38,14 +38,31 @@ DEV_SYSTEM_PROMPT = (
 )
 
 QA_SYSTEM_PROMPT = (
-    "你是严苛的数仓首席架构师。你需要对小弟写的 SQL 进行 Code Review。\n"
-    "检查项：\n"
+    "你是严苛的数仓首席架构师，拥有对高危 SQL 的**一票否决权（FATAL_REJECT）**。\n"
+    "你需要对小弟写的 SQL 进行 Code Review。\n\n"
+    "============================================================\n"
+    "【最高优先级 — 合规红线 — 一票否决 FATAL_REJECT】\n"
+    "如果 SQL 中包含以下任一行为，你必须**立刻熔断流程**：\n"
+    "  (a) DROP TABLE ods_orders 或 DROP TABLE ods_users\n"
+    "  (b) DELETE FROM ods_orders 或 DELETE FROM ods_users\n"
+    "  (c) TRUNCATE TABLE ods_orders 或 TRUNCATE TABLE ods_users\n"
+    "  (d) ALTER TABLE ods_orders ... 或 ALTER TABLE ods_users ...\n"
+    "  (e) CREATE OR REPLACE TABLE ods_orders ... 或 ods_users\n"
+    "  (f) UPDATE ods_orders ... 或 UPDATE ods_users ...\n"
+    "这些核心原始存根表（ods_orders / ods_users）是数仓的根基，不可破坏。\n"
+    "触发此红线时，**严禁提供任何修改意见**，只允许输出：\n"
+    "  FATAL_REJECT: [具体拦截原因，说明企图对哪张 ODS 表做了什么]\n"
+    "============================================================\n\n"
+    "【常规检查项】（仅在未触发 FATAL_REJECT 时生效）\n"
     "1. 严禁使用 SELECT *；\n"
-    "2. 关键字必须大写；\n"
-    "3. 大表关联必须指定字段，不能盲目全表扫描。\n"
-    "4. 【新增红线】如果是建表语句，必须在 CREATE TABLE 之前加上 DROP TABLE IF EXISTS [表名]; 确保脚本可重复执行！\n"
-    "如果完全合格，请只输出 'PASS'；如果有问题，请详细指出修改意见，"
-    "并以 'REJECT: [具体原因]' 开头。"
+    "2. 关键字必须大写（SELECT, FROM, JOIN, GROUP BY 等）；\n"
+    "3. 大表关联必须指定字段，不能盲目全表扫描；\n"
+    "4. 如果是建表语句（CREATE TABLE 非 ods_ 前缀的表），必须在 CREATE 之前加上\n"
+    "   DROP TABLE IF EXISTS [表名]; 确保脚本可重复执行。\n\n"
+    "【返回值规范】\n"
+    "  - FATAL_REJECT 触发 → 仅输出 'FATAL_REJECT: [原因]'，不提供修改建议\n"
+    "  - 完全合格 → 仅输出 'PASS'\n"
+    "  - 有问题 → 以 'REJECT: [具体原因]' 开头，可以给出修改意见"
 )
 
 
@@ -169,6 +186,17 @@ def run_dw_agent_stream(user_requirement: str) -> Generator[Event, None, None]:
     for round_no in range(1, MAX_RETRIES + 1):
         yield {"type": "info", "message": f"[Round {round_no}] QA Architect is reviewing ..."}
         verdict = call_qa_agent(sql)
+
+        # ── FIRST: check for FATAL_REJECT (highest priority) ──
+        if verdict.strip().upper().startswith("FATAL_REJECT"):
+            yield {
+                "type": "fatal",
+                "message": verdict,
+                "round": round_no,
+                "sql": sql,
+            }
+            return
+
         is_pass = verdict.strip().upper().startswith("PASS")
         yield {
             "type": "verdict",
@@ -190,7 +218,7 @@ def run_dw_agent_stream(user_requirement: str) -> Generator[Event, None, None]:
             }
             return
 
-        # REJECT path
+        # Ordinary REJECT path: feed critique back to Dev
         yield {
             "type": "info",
             "message": f">>> QA Architect REJECTED. Reworking (attempt {round_no}/{MAX_RETRIES}) ...",
@@ -248,6 +276,28 @@ def run_dw_agent(user_requirement: str) -> None:
         verdict = call_qa_agent(sql)
         _emit(f"[QA] Verdict:\n  {verdict}\n")
 
+        # ═══════════════════════════════════════════════════════════
+        # FIRST: FATAL_REJECT — compliance circuit breaker
+        # ═══════════════════════════════════════════════════════════
+        if verdict.strip().upper().startswith("FATAL_REJECT"):
+            _emit("!" * 60)
+            _emit("!!!  COMPLIANCE CIRCUIT BREAKER TRIGGERED  !!!")
+            _emit("!" * 60)
+            _emit("")
+            _emit("  [FATAL_REJECT] QA Architect issued a one-shot veto.")
+            _emit("  Reason: The SQL attempts to destroy core ODS tables.")
+            _emit(f"  Detail: {verdict}")
+            _emit("")
+            _emit("  >>> FLOW ABORTED — the offending SQL was NOT executed. <<<")
+            _emit("  >>> The SQL was NOT fed back to Dev Agent for retry. <<<")
+            _emit("")
+            _emit("!" * 60)
+            _emit("!!!  SYSTEM HALTED — ODS TABLES PROTECTED  !!!")
+            _emit("!" * 60)
+
+            _flush_trace(verdict, "FATAL_REJECT", round_no)
+            return
+
         if verdict.strip().upper().startswith("PASS"):
             _emit("=" * 60)
             _emit(">>> QA Architect: APPROVED. Executing SQL. <<<")
@@ -268,7 +318,7 @@ def run_dw_agent(user_requirement: str) -> None:
             _flush_trace(final_sql, outcome, round_no)
             return
 
-        # REJECT path: feed critique back to Dev
+        # Ordinary REJECT path: feed critique back to Dev
         _emit(f">>> QA Architect REJECTED. Reworking (attempt {round_no}/{MAX_RETRIES}) ...\n")
         sql = call_dev_agent(user_requirement, schema_text, feedback=verdict)
         _emit(f"{'─' * 40}\n[Dev] Revised SQL:\n{sql}\n{'─' * 40}")
@@ -296,7 +346,7 @@ def _flush_trace(final_sql: str, outcome: str, rounds: int) -> None:
 
 
 if __name__ == "__main__":
-    # "Phishing" test — likely to trigger SELECT *, testing QA's rejection mechanism
+    # Safe test — normal DWS aggregation requirement
     requirement = (
         "统计一下每个城市的用户注册量，帮我建一张叫 user_city_stat 的表。"
     )

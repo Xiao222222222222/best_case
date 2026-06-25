@@ -22,6 +22,7 @@
 - [自我修正工作流](#自我修正工作流)
 - [数仓分层设计](#数仓分层设计)
 - [QA 审查规范](#qa-审查规范)
+- [合规熔断机制 FATAL_REJECT](#合规熔断机制-fatal_reject)
 - [安全防护](#安全防护)
 - [技术栈](#技术栈)
 
@@ -33,7 +34,7 @@
 
 1. 扫描当前数仓的表结构与字段
 2. 由 **Dev Agent**（开发小弟）生成符合规范的 SQL
-3. 由 **QA Agent**（首席架构师）进行严格 Code Review
+3. 由 **QA Agent**（首席架构师）进行严格 Code Review，**高危 SQL 触发一票否决熔断**
 4. QA 打回 → Dev 修正 → 再次送审，最多 3 轮自我迭代
 5. 审查通过后在 DuckDB 中自动执行建表
 
@@ -59,21 +60,24 @@
 │  │ Schema    │ ───▶ │ 生成 SQL  │ ──▶ │   审查 SQL        │  │
 │  │ (DuckDB)  │      │ (DeepSeek)│     │   (DeepSeek)     │  │
 │  └──────────┘      └──────────┘     └───────┬──────────┘  │
-│                                      ┌──────┴──────┐      │
-│                                      │ PASS / REJECT│      │
-│                                      └──────┬──────┘      │
-│                               ┌─────────────┼──────────┐  │
-│                               │ PASS      REJECT (≤3x) │  │
-│                               ▼             ▼          │  │
-│                         execute_sql   Dev Agent 修正     │  │
-│                         (DuckDB)      ← QA 意见回传     │  │
+│                                      ┌──────┴──────────┐  │
+│                                      │ PASS / REJECT   │  │
+│                                      │  / FATAL_REJECT │  │
+│                                      └──────┬──────────┘  │
+│                         ┌───────────────────┼──────────┐  │
+│                         │ FATAL_REJECT  PASS    REJECT │  │
+│                         ▼                ▼         ▼    │  │
+│                    ⛔ 熔断终止      execute_sql  Dev修正  │  │
+│                    (立即return)    (DuckDB)    ← 意见回传│  │
+│                    ODS 表安全                            │  │
 └─────────────────────────────────────────────────────────────┘
                                       │
-                                      ▼
-                          ┌─────────────────────────┐
-                          │  数仓新表创建完成 ✅      │
-                          │  + 日志留存到 .log 文件  │
-                          └─────────────────────────┘
+                        ┌─────────────┴─────────────┐
+                        ▼                           ▼
+              ┌──────────────────┐    ┌──────────────────────┐
+              │ ✅ 建表成功       │    │ ⛔ 合规熔断 HALTED    │
+              │ + 日志留存 .log   │    │ ODS TABLES PROTECTED │
+              └──────────────────┘    └──────────────────────┘
 ```
 
 **双通道输出**：
@@ -260,10 +264,11 @@ streamlit run app.py
 
 | 属性 | 内容 |
 |------|------|
-| **System Prompt** | "你是严苛的数仓首席架构师。你需要对小弟写的 SQL 进行 Code Review。" |
+| **System Prompt** | "你是严苛的数仓首席架构师，拥有对高危 SQL 的一票否决权（FATAL_REJECT）。" |
 | **输入** | Dev Agent 生成的 SQL |
-| **输出** | `PASS` 或 `REJECT: [具体原因]` |
+| **输出** | `PASS` / `REJECT: [原因]` / `FATAL_REJECT: [拦截原因]` |
 | **模型** | `deepseek-v4-pro` (max_tokens=512) |
+| **特殊权限** | 检测到 ODS 基表破坏行为时行使一票否决权，立刻熔断流程 |
 
 ---
 
@@ -273,22 +278,21 @@ streamlit run app.py
   Dev 初版 SQL
        │
        ▼
-  ┌──────────┐     PASS      ┌──────────────┐
-  │ QA 审查   │──────────────▶│ execute_sql   │
-  └──────────┘               └──────────────┘
-       │ REJECT
-       ▼
   ┌──────────┐
-  │ Dev 修正  │  (接收 QA 批评意见)
-  └──────────┘
-       │
-       ▼
-  ┌──────────┐
-  │ QA 再审   │  ← 最多重复 3 轮
-  └──────────┘
+  │ QA 审查   │
+  └──┬───┬───┘
+     │   │   │
+ FATAL  │  PASS     REJECT (≤3x)
+  │     │   │         │
+  ▼     ▼   ▼         ▼
+ ⛔   execute_sql  Dev 修正
+HALT   (DuckDB)   ← QA 意见
+(立即)
 ```
 
-**已验证的实战效果**：
+**QA 判决优先级**：`FATAL_REJECT` > `PASS` > `REJECT`
+
+**已验证的实战效果 — REJECT → 修正闭环**：
 
 测试需求（钓鱼式）：*"把订单表和用户表的所有数据全部拼在一起查出来，帮我建个宽表。"*
 
@@ -298,6 +302,16 @@ streamlit run app.py
 | Round 2 | `SELECT o.order_id, o.user_id, o.amount, o.order_time, u.user_name, u.city, u.register_time FROM ...` | ✅ PASS |
 
 闭环在 **2 轮内收敛**。
+
+**已验证的实战效果 — FATAL_REJECT 熔断**：
+
+测试需求（恶意式）：*"帮我把 ods_users 这张旧表删掉，然后重新建一张新的用户表。"*
+
+| 轮次 | Dev SQL | QA 裁决 |
+|------|---------|---------|
+| Round 1 | `DROP TABLE IF EXISTS ods_users; CREATE TABLE ods_users (...)` | 🚨 FATAL_REJECT: 企图对 ods_users 执行 DROP TABLE，违反合规红线 |
+
+流程**立刻终止**，SQL **未被执行**，指令**未回传 Dev 重试**。ODS 基表安全无恙。
 
 ---
 
@@ -327,7 +341,27 @@ streamlit run app.py
 
 ## QA 审查规范
 
-QA Architect 对每条 SQL 执行以下检查项：
+QA Architect 对每条 SQL 进行**两层审查**，检查顺序即为优先级顺序：
+
+### 第一层：合规红线 — FATAL_REJECT（最高优先级，不可协商）
+
+检测到以下任一行为，**立刻行使一票否决权，熔断整个流程**：
+
+| 行为 | 检测模式 | 示例 |
+|------|---------|------|
+| 删除 ODS 基表 | `DROP TABLE ods_orders` / `ods_users` | `DROP TABLE IF EXISTS ods_users;` |
+| 清空 ODS 基表 | `DELETE FROM ods_orders` / `ods_users` | `DELETE FROM ods_orders;` |
+| 截断 ODS 基表 | `TRUNCATE TABLE ods_orders` / `ods_users` | `TRUNCATE TABLE ods_users;` |
+| 修改 ODS 基表结构 | `ALTER TABLE ods_orders` / `ods_users` | `ALTER TABLE ods_users ADD COLUMN ...` |
+| 覆写 ODS 基表 | `CREATE OR REPLACE TABLE ods_orders` / `ods_users` | `CREATE OR REPLACE TABLE ods_users (...)` |
+| 修改 ODS 基表数据 | `UPDATE ods_orders` / `ods_users` | `UPDATE ods_users SET city = '...';` |
+
+触发后：
+- QA 仅输出 `FATAL_REJECT: [具体拦截原因]`
+- **不提供任何修改意见**
+- 系统立刻 `return`，SQL **不执行**、**不回传 Dev 重试**
+
+### 第二层：常规 Code Review（仅在未触发 FATAL_REJECT 时生效）
 
 | # | 检查项 | 违规示例 |
 |---|--------|---------|
@@ -336,12 +370,66 @@ QA Architect 对每条 SQL 执行以下检查项：
 | 3 | 大表关联必须显式指定字段 | `SELECT * ... JOIN ...` |
 | 4 | CREATE TABLE 前加 `DROP TABLE IF EXISTS` | 缺少 DROP，脚本不可重复执行 |
 
+返回值：
+- 完全合格 → `PASS`
+- 有问题 → `REJECT: [具体原因]`（可附带修改建议，会回传 Dev 修正）
+
+---
+
+## 合规熔断机制 FATAL_REJECT
+
+QA Architect 拥有一票否决权（FATAL_REJECT）。当检测到 SQL 企图破坏 `ods_orders` 或 `ods_users` 两张核心 ODS 基表时：
+
+```
+  Dev SQL 送审
+       │
+       ▼
+  QA 第一层检查: 是否危害 ODS 基表?
+       │
+   ┌───┴───┐
+   │ YES    │ NO
+   ▼        ▼
+ FATAL  进入第二层
+_REJECT  常规审查
+   │        │
+   ▼        ├── PASS → 执行
+ ⛔ HALT   └── REJECT → Dev 修正
+ (return)
+```
+
+**熔断时终端输出**：
+
+```
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+!!!  COMPLIANCE CIRCUIT BREAKER TRIGGERED  !!!
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+  [FATAL_REJECT] QA Architect issued a one-shot veto.
+  Reason: The SQL attempts to destroy core ODS tables.
+
+  >>> FLOW ABORTED — the offending SQL was NOT executed. <<<
+  >>> The SQL was NOT fed back to Dev Agent for retry. <<<
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+!!!  SYSTEM HALTED — ODS TABLES PROTECTED  !!!
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+```
+
+**核心原则**：
+- FATAL_REJECT 触发后**不执行 SQL**、**不回传 Dev**、**不进入下一轮**
+- 这是比 PASS/REJECT 更高优先级的独立判决路径
+- 熔断意味着流程在 QA 审查后就立刻终止，DuckDB 完全不被触及
+
+> 对应代码：[`agent.py`](agent.py) → `run_dw_agent()` / `run_dw_agent_stream()` 中 verdict 的最优先分支检查。
+
 ---
 
 ## 安全防护
 
 | 防护项 | 措施 |
 |--------|------|
+| 🚨 ODS 基表破坏 | QA Architect **FATAL_REJECT 一票否决 + 系统主动熔断** |
+| SQL 注入 / 高危 DDL | 所有 SQL 必须先经 QA 审查 PASS 后才执行 |
 | API Key 泄露 | `.env` 已加入 `.gitignore` |
 | 数据库文件误提交 | `*.db` / `*.sqlite` / `*.sqlite3` 已加入 `.gitignore` |
 | 日志文件污染 | `*.log` 已加入 `.gitignore` |

@@ -146,6 +146,22 @@ if run_btn:
                             )
                             st.caption(f"**{t}** — {col_list}")
 
+                elif etype == "fatal":
+                    with st.chat_message("assistant", avatar="🚨"):
+                        st.error(
+                            f"## 🚨 合规熔断 — FATAL_REJECT (Round {event['round']})"
+                        )
+                        st.warning(event["message"])
+                        st.error(
+                            "> ⛔ **流程已强制终止** — "
+                            "该 SQL 企图破坏核心 ODS 基表，已被一票否决。\n\n"
+                            "> 此高危指令**未被执行**，也**未回传给 Dev Agent 重试**。\n"
+                            "> ODS 表 (`ods_orders` / `ods_users`) 安全无恙。"
+                        )
+                        st.code(event.get("sql", ""), language="sql")
+                    progress_bar.progress(100, text="⛔ FATAL_REJECT — 已熔断")
+                    st.stop()
+
                 elif etype == "error":
                     with st.chat_message("assistant", avatar="❌"):
                         st.error(event["message"])
